@@ -1,0 +1,885 @@
+---
+title: "K01_BRFSS_BreastCancer"
+author: "Hanwen Zhang"
+date: "2024-06-17"
+output: word_document
+---
+
+## Load Libraries
+
+```{r libraries, warning=F, message=F}
+rm(list=ls())
+
+library(openxlsx)    #Read excel files 
+library(writexl)     #Write Excel Files 
+library(tidyverse)   # ggplot & data manipulation packages
+library(survey)      # for incorporating complex survey design
+library(ggplot2)      # for pretty graphs
+library(ggpubr)       # also for pretty graphs
+library(flextable)    # also for formated tables
+library(margins)      # marginal effects
+library(dplyr)
+library(marginaleffects)
+library(sandwich)
+library(haven)
+library(srvyr)
+library(gtsummary)
+library(flextable)
+library(glue)
+```
+
+## Import Data Files
+
+```{r setup, include=FALSE}
+dir <- "C:/Users/hzhan/Box/ICHR/01.Analysis"
+setwd(dir)
+
+load("./02.Data Files/BRFSS2024.RData")
+load("./02.Data Files/BRFSS2022.RData") 
+```
+
+## Choose variables and clean the BC screening vars
+
+```{r Cleaning}
+setwd(dir); source("./03.Code/01.Import.R")
+
+BRFSS_all$Weight_2 <- BRFSS_all$Weight/2
+rm(list = setdiff(ls(), c("BRFSS_all", "dir")))
+```
+
+## Data Cleaning
+
+```{r cleaning}
+setwd(dir)
+source("./03.Code/02.Cleaning.R")
+```
+
+## Identifying LGBQ and study sample
+
+```{r lgbtq}
+BRFSS_all$LGBQ <- ifelse((BRFSS_all$Orient_Female == 7 |
+                          BRFSS_all$Orient_Female == 9 ), NA, 
+                 (ifelse((BRFSS_all$Orient_Female == 1), 1, 
+                 (ifelse(BRFSS_all$Orient_Female == 3 |
+                         BRFSS_all$Orient_Female == 4, 2, 0))))) 
+BRFSS_all$LGBQ_bin <- ifelse((BRFSS_all$Orient_Female == 7 |
+                              BRFSS_all$Orient_Female == 9 ), NA, 
+                     (ifelse(BRFSS_all$Orient_Female == 1 | 
+                             BRFSS_all$Orient_Female == 3 |
+                             BRFSS_all$Orient_Female == 4, 1, 0)))
+BRFSS_all$LGBQ_bis <- ifelse((BRFSS_all$Orient_Female == 1 |
+                              BRFSS_all$Orient_Female == 7 |
+                              BRFSS_all$Orient_Female == 9 ), NA, 
+                     (ifelse(BRFSS_all$Orient_Female == 3 |
+                             BRFSS_all$Orient_Female == 4, 1, 0)))
+BRFSS_all$LGBQ_les <- ifelse((BRFSS_all$Orient_Female == 3 |
+                              BRFSS_all$Orient_Female == 4 |
+                              BRFSS_all$Orient_Female == 7 |
+                              BRFSS_all$Orient_Female == 9 ), NA, 
+                     (ifelse(BRFSS_all$Orient_Female == 1, 1, 0)))
+# BRFSS_all$Transgender <- ifelse((BRFSS_all$Transgender == 2 | 
+#                                  BRFSS_all$Transgender == 3), 1,
+#                          ifelse((BRFSS_all$Transgender == 7 | 
+#                                  BRFSS_all$Transgender == 9), NA, 0))
+
+# State with SDOH and SOGI modules
+BRFSS_all$Sample_State <- ifelse((BRFSS_all$Year == 2024 &
+                                  BRFSS_all$State %in% c(1,2,4,10,13,15,16,18,19,20,22,24,25,27,30,34,35,37,38,44,49,54,55,78)) |
+                                 (BRFSS_all$Year == 2022 &
+                                  BRFSS_all$State %in% c(2,9,10,13,18,19,20,25,27,29,30,32,35,37,44,48,49,50,53,54,55)), 1, 0)
+
+# Study sample for breast cancer screening
+BRFSS_all$Personal_history <- as.numeric(BRFSS_all$CancerType %in% c(5, 18))
+BRFSS_all$Sample_ElgBC <- ifelse(BRFSS_all$Age >= 50 &  
+                                 BRFSS_all$Age < 75 & 
+                                 BRFSS_all$Sex == 2 &
+                                 BRFSS_all$Sample_State == 1 &
+                                 BRFSS_all$Personal_history != 1 &
+                                 !is.na(BRFSS_all$LGBQ_bin) &
+                                 !is.na(BRFSS_all$BC_Ever) &
+                                 !is.na(BRFSS_all$BC_UTD), 1, 0)
+
+# Aged 40-75 in case needed
+BRFSS_all$Sample_ElgBC40 <- ifelse(BRFSS_all$Age >= 40 &  
+                                   BRFSS_all$Age < 75 & 
+                                   BRFSS_all$Sex == 2 &
+                                   BRFSS_all$Sample_State == 1 &
+                                   BRFSS_all$Personal_history != 1 &
+                                   !is.na(BRFSS_all$LGBQ_bin) &  
+                                   !is.na(BRFSS_all$BC_Ever) & 
+                                   !is.na(BRFSS_all$BC_UTD), 1, 0)
+
+# Flow chart
+BRFSS_all$Flow_chart     <- ifelse(BRFSS_all$Age >= 50 &  
+                                   BRFSS_all$Age < 75 & 
+                                   BRFSS_all$Sex == 2 &
+                                   BRFSS_all$Sample_State == 1, 1, 0)
+table(BRFSS_all$LGBQ_bin, BRFSS_all$Flow_chart)
+
+# table(BRFSS_all$LGBQ, BRFSS_all$Sample_ElgBC)
+# 
+#          0      1
+#   0 166358  77110
+#   1   3321   1237
+#   2  14591   2086
+```
+
+## Flag complete case
+
+```{r complete}
+# All covariates
+BRFSS_complete_all <- BRFSS_all %>%
+  select(ID, PSU, Strata, Weight_2, Sample_ElgBC, Sample_ElgBC40, BC_Ever, BC_UTD, LGBQ_bin, LGBQ,
+         HouseIns, TransIns, UtilityIns, FoodStamp, EmployIns, FoodIns, EmoSupport,
+         Age, Age_Cat, Age_Cat2, Race, Urban, Region, Edu, Marital_Cat, Employ, Hlthplan, Wellness, RegSource, MED_Dff, HLTHSTAT, Chronic_Cat) %>%
+         #DrinkBinge, Smoke, PhyAct
+  mutate(across(everything(), ~ifelse(tolower(.) == "missing", NA, .))) %>%
+  mutate(flag_complete_all = ifelse(complete.cases(.) & Sample_ElgBC == 1, 1, 0))
+BRFSS_all$flag_complete_all <- BRFSS_complete_all$flag_complete_all
+
+# Only UMN
+BRFSS_complete_UMN <- BRFSS_all %>%
+  select(ID, PSU, Strata, Weight_2, Sample_ElgBC, Sample_ElgBC40, BC_Ever, BC_UTD, LGBQ_bin, LGBQ,
+         HouseIns, TransIns, UtilityIns, FoodStamp, EmployIns, FoodIns, EmoSupport) %>%
+  mutate(across(everything(), ~ifelse(tolower(.) == "missing", NA, .))) %>%
+  mutate(flag_complete_UMN = ifelse(complete.cases(.) & Sample_ElgBC == 1, 1, 0))
+BRFSS_all$flag_complete_UMN <- BRFSS_complete_UMN$flag_complete_UMN
+
+# At least 1 UMN
+BRFSS_complete_one <- BRFSS_all %>%
+  select(ID, PSU, Strata, Weight_2, Sample_ElgBC, Sample_ElgBC40, BC_Ever, BC_UTD, LGBQ_bin, LGBQ,
+         HouseIns, TransIns, UtilityIns, FoodStamp, EmployIns, FoodIns, EmoSupport) %>%
+  mutate(across(everything(), ~ifelse(tolower(.) == "missing", NA, .))) %>%
+  mutate(flag_complete_one = ifelse(
+    rowSums(!is.na(pick(HouseIns, TransIns, UtilityIns, FoodStamp, EmployIns, FoodIns, EmoSupport))) > 0 &
+    Sample_ElgBC == 1,
+    1, 0
+  ))
+BRFSS_all$flag_complete_one <- BRFSS_complete_one$flag_complete_one
+
+write_dta(BRFSS_all, "BRFSS_all.dta")
+
+table(BRFSS_all$LGBQ, BRFSS_all$flag_complete_all, BRFSS_all$Sample_ElgBC)
+table(BRFSS_all$LGBQ, BRFSS_all$flag_complete_UMN, BRFSS_all$Sample_ElgBC)
+table(BRFSS_all$LGBQ, BRFSS_all$flag_complete_one, BRFSS_all$Sample_ElgBC)
+
+#     0     1     2 
+# 65080   1055  1675 
+
+#     0     1     2 
+# 71588   1151  1915 
+
+#     0     1     2 
+# 73252   1164  1972 
+```
+
+
+## Create dummy variables
+
+```{r dummy}
+setwd(dir)
+source("./03.Code/03.Dummy.R")
+```
+
+## Final data
+
+```{r final_data}
+# For descriptive analysis
+BRFSS_final <- BRFSS_all %>%
+               select(ID, PSU, Strata, Weight_2, Sample_ElgBC, Sample_ElgBC40, BC_Ever, BC_UTD, LGBQ_bin, LGBQ, LGBQ_bis, 
+                      flag_complete_all, flag_complete_UMN, flag_complete_one,
+                      HouseIns, TransIns, UtilityIns, FoodStamp, EmployIns, FoodIns, EmoSupport,
+                      HouseIns_prev, TransIns_prev, UtilityIns_prev, FoodStamp_prev, EmployIns_prev, FoodIns_prev, EmoSupport_prev,
+                      Age, Age_Cat, Age_Cat2, Race, Urban, Region, Edu, Marital_Cat, Income_Cat, Employ,
+                      HLTHSTAT, Chronic, Chronic_Cat,
+                      Hlthplan, RegSource, MED_Dff, Wellness,
+                      DrinkBinge, PhyAct, Smoke)
+
+# For decomposition
+BRFSS_dum <- BRFSS_all %>%
+             select(ID, PSU, Strata, Weight_2, Sample_ElgBC, Sample_ElgBC40, BC_Ever, BC_UTD, LGBQ_bin, LGBQ, LGBQ_bis, 
+                    flag_complete_all, flag_complete_UMN, flag_complete_one,
+                    EmoSupport_Yes, EmployIns_Yes, FoodIns_Yes, FoodStamp_Yes, HouseIns_Yes, TransIns_Yes, UtilityIns_Yes,
+                    EmoSupport_MIS, EmployIns_MIS, FoodIns_MIS, FoodStamp_MIS, HouseIns_MIS, TransIns_MIS, UtilityIns_MIS,
+                    Age, Race_BL, Race_OT, Race_ML, Race_HI, Race_MI, 
+                    Region_SO, Region_MW, Region_WT, 
+                    Urban_No, Urban_MI, 
+                    Edu_LHS, Edu_HSG, Edu_ASS, Edu_MIS,
+                    Employ_No, Employ_MIS,
+                    Marital_Div, Marital_Nev, Marital_MIS,
+                    Ins_No, Ins_MIS, 
+                    Reg_No, Reg_MIS,
+                    Med_Yes, Med_MIS,
+                    Inc_1, Inc_2, Inc_MIS,
+                    Wellness_No, Wellness_MIS,
+                    Chronic_Yes, Chronic_MIS,
+                    HLTHSTAT_POOR, HLTHSTAT_MIS,
+                    DrinkBinge_Yes, DrinkBinge_MIS,
+                    PhyAct_No, PhyAct_MIS,
+                    Smoke_Current, Smoke_Former, Smoke_MIS)
+
+write_dta(BRFSS_all, "BRFSS_all.dta")
+write_dta(BRFSS_dum, "BRFSS_dum.dta")
+write_dta(BRFSS_final, "BRFSS_final.dta")
+
+save(BRFSS_all, file = "BRFSS_all.RData")
+save(BRFSS_dum, file = "BRFSS_dum.RData")
+save(BRFSS_final, file = "BRFSS_final.RData")
+
+```
+
+
+## Survey data
+
+```{r survey data}
+setwd(dir)
+
+load("./03.Code/BRFSS_dum.RData")
+load("./03.Code/BRFSS_final.RData")
+
+f.svy_set <- function(data_in) {
+  data_out <- svydesign(id = ~PSU,
+                        strata  = ~Strata,
+                        weights = ~Weight_2,
+                        nest    = TRUE,
+                        data    = data_in)
+}
+options(survey.lonely.psu = "adjust")
+
+set.BRFSS_final <- f.svy_set(BRFSS_final)
+set.BRFSS_dum   <- f.svy_set(BRFSS_dum)
+
+sub.BRFSS_final <- subset(set.BRFSS_final, flag_complete_UMN == 1)
+sub.BRFSS_dum   <- subset(set.BRFSS_dum, flag_complete_UMN == 1)
+```
+
+## Check missingness
+
+```{r missing}
+sample <- BRFSS_all[BRFSS_all$Sample_ElgBC ==1,]
+sample %>%
+  group_by(LGBQ_bin) %>%
+  summarise(across(c(EmoSupport, EmployIns, FoodStamp,FoodIns, HouseIns,UtilityIns,TransIns),
+                   ~mean(. == "1", na.rm = F) * 100)) %>%
+  pivot_longer(-LGBQ_bin,
+               names_to = "variable",
+               values_to = "pct_missing")
+
+sample <- BRFSS_all[BRFSS_all$Sample_ElgBC ==1,]
+sample %>%
+  group_by(LGBQ_bin) %>%
+  summarise(across(flag_complete_all, ~mean(. == 0, na.rm = F) * 100)) %>%
+  pivot_longer(-LGBQ_bin,
+               names_to = "variable",
+               values_to = "pct_missing")
+sample %>%
+  group_by(LGBQ_bin) %>%
+  summarise(across(flag_complete_UMN, ~mean(. == 0, na.rm = F) * 100)) %>%
+  pivot_longer(-LGBQ_bin,
+               names_to = "variable",
+               values_to = "pct_missing")
+sample %>%
+  group_by(LGBQ_bin) %>%
+  summarise(across(flag_complete_one, ~mean(. == 0, na.rm = F) * 100)) %>%
+  pivot_longer(-LGBQ_bin,
+               names_to = "variable",
+               values_to = "pct_missing")
+
+
+ci_BC_UTD        <- svyciprop(~BC_UTD, subset(set.BRFSS_final,  Sample_ElgBC == 1), method = "logit")
+ci_BC_UTD_str    <- svyciprop(~BC_UTD, subset(set.BRFSS_final,  Sample_ElgBC == 1 & LGBQ_bin == 0), method = "logit")
+ci_BC_UTD_lgbq   <- svyciprop(~BC_UTD, subset(set.BRFSS_final,  Sample_ElgBC == 1 & LGBQ_bin == 1), method = "logit")
+ci_BC_UTD_les    <- svyciprop(~BC_UTD, subset(set.BRFSS_final,  Sample_ElgBC == 1 & LGBQ == 1), method = "logit")
+ci_BC_UTD_bis    <- svyciprop(~BC_UTD, subset(set.BRFSS_final,  Sample_ElgBC == 1 & LGBQ == 2), method = "logit")
+
+cat(paste0(round(ci_BC_UTD[1] * 100, 1), " (", round(attr(ci_BC_UTD, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_UTD, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_BC_UTD_str[1] * 100, 1), " (", round(attr(ci_BC_UTD_str, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_UTD_str, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_BC_UTD_lgbq[1] * 100, 1), " (", round(attr(ci_BC_UTD_lgbq, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_UTD_lgbq, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_BC_UTD_les[1] * 100, 1), " (", round(attr(ci_BC_UTD_les, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_UTD_les, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_BC_UTD_bis[1] * 100, 1), " (", round(attr(ci_BC_UTD_bis, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_UTD_bis, "ci")[2] * 100, 1), ")"), sep = "\n")
+
+dat <- expand.grid(
+  indicator = c("Total",
+                "Straight",
+                "LGBQ",
+                "Lesbian/Gay",
+                "Bisexual/Queer"
+                ),
+  group     = c("With complete HRSN data", "Missing any HRSN data", "All eligible women")) %>%
+  mutate(prev = c(79.4, 79.6, 74.5, 79.2, 71.8,
+                  75.4, 76.1, 61.2, 63.2, 60.5,
+                  79.1, 79.3, 73.2, 78.0, 70.5),
+         lcl  = c(78.8, 79.0, 69.6, 74.1, 64.9,
+                  73.0, 73.7, 46.0, 43.8, 40.9, 
+                  78.5, 78.7, 68.5, 73.1, 64.0),
+         ucl  = c(80.0, 80.2, 78.8, 83.5, 77.9,
+                  77.6, 78.3, 74.5, 79.0, 77.2,
+                  79.6, 79.9, 77.3, 82.2, 76.3))
+
+dodge <- position_dodge(width = 0.8)
+
+ggplot(dat, aes(x = indicator, y = prev, fill = group)) +
+  geom_col(position = dodge, width = 0.7) +
+  geom_errorbar(aes(ymin = lcl, ymax = ucl),
+                position = dodge, width = 0.25,
+                linewidth = 0.4, color = "gray25") +
+  #coord_flip() +                                              
+  scale_x_discrete(limits = levels(dat$indicator)) +     
+  scale_fill_manual(values = c("#9E9E9E", "#DDDDDD", "#4D4D4D")) +
+  scale_y_continuous(name = "Prevalence (%)") +
+  labs(x = NULL, fill = NULL) +
+  theme_bw(base_size = 11, base_family = "Times New Roman") +
+  theme(panel.grid.major.y = element_blank(),                 
+        legend.position = "top")
+```
+
+## Table 1
+
+```{r table 1}
+
+# Total
+n_uw   <- as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$LGBQ_bin))
+n_w    <- svytable(~LGBQ_bin, sub.BRFSS_final)
+prop_w <- as.numeric(prop.table(svytable(~LGBQ_bin, sub.BRFSS_final)) * 100)
+n_uw_overall <- sum(n_uw)
+n_w_overall  <- sum(n_w)
+
+
+#### Age -----------------------------------------------------------------------
+n_Age         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$Age_Cat)), 0)
+prop_Age      <- round(as.numeric(prop.table(svytable(~Age_Cat, sub.BRFSS_final))) * 100, 1)
+n_Age_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$Age_Cat)), 0)
+prop_Age_str  <- round(as.numeric(prop.table(svytable(~Age_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_Age_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$Age_Cat)), 0)
+prop_Age_lgbq <- round(as.numeric(prop.table(svytable(~Age_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_Age_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$Age_Cat)), 0)
+prop_Age_les  <- round(as.numeric(prop.table(svytable(~Age_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_Age_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$Age_Cat)), 0)
+prop_Age_bis  <- round(as.numeric(prop.table(svytable(~Age_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_Age, " (", format(n_Age, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Age_str, " (", format(n_Age_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Age_lgbq, " (", format(n_Age_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Age_les, " (", format(n_Age_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Age_bis, " (", format(n_Age_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+
+#### Race ----------------------------------------------------------------------
+n_Race         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$Race)), 0)
+prop_Race      <- round(as.numeric(prop.table(svytable(~Race, sub.BRFSS_final))) * 100, 1)
+n_Race_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$Race)), 0)
+prop_Race_str  <- round(as.numeric(prop.table(svytable(~Race, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_Race_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$Race)), 0)
+prop_Race_lgbq <- round(as.numeric(prop.table(svytable(~Race, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_Race_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$Race)), 0)
+prop_Race_les  <- round(as.numeric(prop.table(svytable(~Race, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_Race_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$Race)), 0)
+prop_Race_bis  <- round(as.numeric(prop.table(svytable(~Race, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_Race, " (", format(n_Race, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Race_str, " (", format(n_Race_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Race_lgbq, " (", format(n_Race_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Race_les, " (", format(n_Race_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Race_bis, " (", format(n_Race_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+
+#### Region ----------------------------------------------------------------------
+n_Region         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$Region)), 0)
+prop_Region      <- round(as.numeric(prop.table(svytable(~Region, sub.BRFSS_final))) * 100, 1)
+n_Region_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$Region)), 0)
+prop_Region_str  <- round(as.numeric(prop.table(svytable(~Region, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_Region_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$Region)), 0)
+prop_Region_lgbq <- round(as.numeric(prop.table(svytable(~Region, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_Region_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$Region)), 0)
+prop_Region_les  <- round(as.numeric(prop.table(svytable(~Region, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_Region_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$Region)), 0)
+prop_Region_bis  <- round(as.numeric(prop.table(svytable(~Region, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_Region, " (", format(n_Region, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Region_str, " (", format(n_Region_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Region_lgbq, " (", format(n_Region_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Region_les, " (", format(n_Region_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Region_bis, " (", format(n_Region_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+
+#### Urban ----------------------------------------------------------------------
+n_Urban         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$Urban)), 0)
+prop_Urban      <- round(as.numeric(prop.table(svytable(~Urban, sub.BRFSS_final))) * 100, 1)
+n_Urban_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$Urban)), 0)
+prop_Urban_str  <- round(as.numeric(prop.table(svytable(~Urban, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_Urban_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$Urban)), 0)
+prop_Urban_lgbq <- round(as.numeric(prop.table(svytable(~Urban, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_Urban_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$Urban)), 0)
+prop_Urban_les  <- round(as.numeric(prop.table(svytable(~Urban, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_Urban_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$Urban)), 0)
+prop_Urban_bis  <- round(as.numeric(prop.table(svytable(~Urban, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_Urban, " (", format(n_Urban, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Urban_str, " (", format(n_Urban_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Urban_lgbq, " (", format(n_Urban_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Urban_les, " (", format(n_Urban_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Urban_bis, " (", format(n_Urban_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+
+#### Edu ----------------------------------------------------------------------
+n_Edu         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$Edu)), 0)
+prop_Edu      <- round(as.numeric(prop.table(svytable(~Edu, sub.BRFSS_final))) * 100, 1)
+n_Edu_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$Edu)), 0)
+prop_Edu_str  <- round(as.numeric(prop.table(svytable(~Edu, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_Edu_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$Edu)), 0)
+prop_Edu_lgbq <- round(as.numeric(prop.table(svytable(~Edu, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_Edu_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$Edu)), 0)
+prop_Edu_les  <- round(as.numeric(prop.table(svytable(~Edu, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_Edu_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$Edu)), 0)
+prop_Edu_bis  <- round(as.numeric(prop.table(svytable(~Edu, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_Edu, " (", format(n_Edu, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Edu_str, " (", format(n_Edu_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Edu_lgbq, " (", format(n_Edu_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Edu_les, " (", format(n_Edu_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Edu_bis, " (", format(n_Edu_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+
+#### Marital_Cat ----------------------------------------------------------------------
+n_Marital_Cat         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$Marital_Cat)), 0)
+prop_Marital_Cat      <- round(as.numeric(prop.table(svytable(~Marital_Cat, sub.BRFSS_final))) * 100, 1)
+n_Marital_Cat_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$Marital_Cat)), 0)
+prop_Marital_Cat_str  <- round(as.numeric(prop.table(svytable(~Marital_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_Marital_Cat_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$Marital_Cat)), 0)
+prop_Marital_Cat_lgbq <- round(as.numeric(prop.table(svytable(~Marital_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_Marital_Cat_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$Marital_Cat)), 0)
+prop_Marital_Cat_les  <- round(as.numeric(prop.table(svytable(~Marital_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_Marital_Cat_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$Marital_Cat)), 0)
+prop_Marital_Cat_bis  <- round(as.numeric(prop.table(svytable(~Marital_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_Marital_Cat, " (", format(n_Marital_Cat, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Marital_Cat_str, " (", format(n_Marital_Cat_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Marital_Cat_lgbq, " (", format(n_Marital_Cat_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Marital_Cat_les, " (", format(n_Marital_Cat_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Marital_Cat_bis, " (", format(n_Marital_Cat_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+
+#### Employ ----------------------------------------------------------------------
+n_Employ         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$Employ)), 0)
+prop_Employ      <- round(as.numeric(prop.table(svytable(~Employ, sub.BRFSS_final))) * 100, 1)
+n_Employ_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$Employ)), 0)
+prop_Employ_str  <- round(as.numeric(prop.table(svytable(~Employ, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_Employ_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$Employ)), 0)
+prop_Employ_lgbq <- round(as.numeric(prop.table(svytable(~Employ, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_Employ_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$Employ)), 0)
+prop_Employ_les  <- round(as.numeric(prop.table(svytable(~Employ, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_Employ_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$Employ)), 0)
+prop_Employ_bis  <- round(as.numeric(prop.table(svytable(~Employ, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_Employ, " (", format(n_Employ, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Employ_str, " (", format(n_Employ_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Employ_lgbq, " (", format(n_Employ_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Employ_les, " (", format(n_Employ_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Employ_bis, " (", format(n_Employ_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+
+#### Income_Cat ----------------------------------------------------------------------
+n_Income_Cat         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$Income_Cat)), 0)
+prop_Income_Cat      <- round(as.numeric(prop.table(svytable(~Income_Cat, sub.BRFSS_final))) * 100, 1)
+n_Income_Cat_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$Income_Cat)), 0)
+prop_Income_Cat_str  <- round(as.numeric(prop.table(svytable(~Income_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_Income_Cat_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$Income_Cat)), 0)
+prop_Income_Cat_lgbq <- round(as.numeric(prop.table(svytable(~Income_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_Income_Cat_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$Income_Cat)), 0)
+prop_Income_Cat_les  <- round(as.numeric(prop.table(svytable(~Income_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_Income_Cat_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$Income_Cat)), 0)
+prop_Income_Cat_bis  <- round(as.numeric(prop.table(svytable(~Income_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_Income_Cat, " (", format(n_Income_Cat, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Income_Cat_str, " (", format(n_Income_Cat_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Income_Cat_lgbq, " (", format(n_Income_Cat_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Income_Cat_les, " (", format(n_Income_Cat_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Income_Cat_bis, " (", format(n_Income_Cat_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+
+#### HLTHSTAT ----------------------------------------------------------------------
+n_HLTHSTAT         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$HLTHSTAT)), 0)
+prop_HLTHSTAT      <- round(as.numeric(prop.table(svytable(~HLTHSTAT, sub.BRFSS_final))) * 100, 1)
+n_HLTHSTAT_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$HLTHSTAT)), 0)
+prop_HLTHSTAT_str  <- round(as.numeric(prop.table(svytable(~HLTHSTAT, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_HLTHSTAT_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$HLTHSTAT)), 0)
+prop_HLTHSTAT_lgbq <- round(as.numeric(prop.table(svytable(~HLTHSTAT, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_HLTHSTAT_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$HLTHSTAT)), 0)
+prop_HLTHSTAT_les  <- round(as.numeric(prop.table(svytable(~HLTHSTAT, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_HLTHSTAT_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$HLTHSTAT)), 0)
+prop_HLTHSTAT_bis  <- round(as.numeric(prop.table(svytable(~HLTHSTAT, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_HLTHSTAT, " (", format(n_HLTHSTAT, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_HLTHSTAT_str, " (", format(n_HLTHSTAT_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_HLTHSTAT_lgbq, " (", format(n_HLTHSTAT_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_HLTHSTAT_les, " (", format(n_HLTHSTAT_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_HLTHSTAT_bis, " (", format(n_HLTHSTAT_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+
+#### Chronic_Cat ----------------------------------------------------------------------
+n_Chronic_Cat         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$Chronic_Cat)), 0)
+prop_Chronic_Cat      <- round(as.numeric(prop.table(svytable(~Chronic_Cat, sub.BRFSS_final))) * 100, 1)
+n_Chronic_Cat_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$Chronic_Cat)), 0)
+prop_Chronic_Cat_str  <- round(as.numeric(prop.table(svytable(~Chronic_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_Chronic_Cat_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$Chronic_Cat)), 0)
+prop_Chronic_Cat_lgbq <- round(as.numeric(prop.table(svytable(~Chronic_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_Chronic_Cat_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$Chronic_Cat)), 0)
+prop_Chronic_Cat_les  <- round(as.numeric(prop.table(svytable(~Chronic_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_Chronic_Cat_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$Chronic_Cat)), 0)
+prop_Chronic_Cat_bis  <- round(as.numeric(prop.table(svytable(~Chronic_Cat, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_Chronic_Cat, " (", format(n_Chronic_Cat, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Chronic_Cat_str, " (", format(n_Chronic_Cat_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Chronic_Cat_lgbq, " (", format(n_Chronic_Cat_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Chronic_Cat_les, " (", format(n_Chronic_Cat_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Chronic_Cat_bis, " (", format(n_Chronic_Cat_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+
+#### Hlthplan ----------------------------------------------------------------------
+n_Hlthplan         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$Hlthplan)), 0)
+prop_Hlthplan      <- round(as.numeric(prop.table(svytable(~Hlthplan, sub.BRFSS_final))) * 100, 1)
+n_Hlthplan_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$Hlthplan)), 0)
+prop_Hlthplan_str  <- round(as.numeric(prop.table(svytable(~Hlthplan, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_Hlthplan_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$Hlthplan)), 0)
+prop_Hlthplan_lgbq <- round(as.numeric(prop.table(svytable(~Hlthplan, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_Hlthplan_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$Hlthplan)), 0)
+prop_Hlthplan_les  <- round(as.numeric(prop.table(svytable(~Hlthplan, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_Hlthplan_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$Hlthplan)), 0)
+prop_Hlthplan_bis  <- round(as.numeric(prop.table(svytable(~Hlthplan, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_Hlthplan, " (", format(n_Hlthplan, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Hlthplan_str, " (", format(n_Hlthplan_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Hlthplan_lgbq, " (", format(n_Hlthplan_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Hlthplan_les, " (", format(n_Hlthplan_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Hlthplan_bis, " (", format(n_Hlthplan_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+
+#### RegSource ----------------------------------------------------------------------
+n_RegSource         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$RegSource)), 0)
+prop_RegSource      <- round(as.numeric(prop.table(svytable(~RegSource, sub.BRFSS_final))) * 100, 1)
+n_RegSource_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$RegSource)), 0)
+prop_RegSource_str  <- round(as.numeric(prop.table(svytable(~RegSource, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_RegSource_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$RegSource)), 0)
+prop_RegSource_lgbq <- round(as.numeric(prop.table(svytable(~RegSource, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_RegSource_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$RegSource)), 0)
+prop_RegSource_les  <- round(as.numeric(prop.table(svytable(~RegSource, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_RegSource_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$RegSource)), 0)
+prop_RegSource_bis  <- round(as.numeric(prop.table(svytable(~RegSource, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_RegSource, " (", format(n_RegSource, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_RegSource_str, " (", format(n_RegSource_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_RegSource_lgbq, " (", format(n_RegSource_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_RegSource_les, " (", format(n_RegSource_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_RegSource_bis, " (", format(n_RegSource_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+
+#### MED_Dff ----------------------------------------------------------------------
+n_MED_Dff         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$MED_Dff)), 0)
+prop_MED_Dff      <- round(as.numeric(prop.table(svytable(~MED_Dff, sub.BRFSS_final))) * 100, 1)
+n_MED_Dff_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$MED_Dff)), 0)
+prop_MED_Dff_str  <- round(as.numeric(prop.table(svytable(~MED_Dff, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_MED_Dff_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$MED_Dff)), 0)
+prop_MED_Dff_lgbq <- round(as.numeric(prop.table(svytable(~MED_Dff, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_MED_Dff_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$MED_Dff)), 0)
+prop_MED_Dff_les  <- round(as.numeric(prop.table(svytable(~MED_Dff, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_MED_Dff_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$MED_Dff)), 0)
+prop_MED_Dff_bis  <- round(as.numeric(prop.table(svytable(~MED_Dff, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_MED_Dff, " (", format(n_MED_Dff, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_MED_Dff_str, " (", format(n_MED_Dff_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_MED_Dff_lgbq, " (", format(n_MED_Dff_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_MED_Dff_les, " (", format(n_MED_Dff_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_MED_Dff_bis, " (", format(n_MED_Dff_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+
+#### Wellness ----------------------------------------------------------------------
+n_Wellness         <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1,]$Wellness)), 0)
+prop_Wellness      <- round(as.numeric(prop.table(svytable(~Wellness, sub.BRFSS_final))) * 100, 1)
+n_Wellness_str     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 0,]$Wellness)), 0)
+prop_Wellness_str  <- round(as.numeric(prop.table(svytable(~Wellness, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0)))) * 100, 1)
+n_Wellness_lgbq    <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ_bin == 1,]$Wellness)), 0)
+prop_Wellness_lgbq <- round(as.numeric(prop.table(svytable(~Wellness, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1)))) * 100, 1)
+n_Wellness_les     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 1,]$Wellness)), 0)
+prop_Wellness_les  <- round(as.numeric(prop.table(svytable(~Wellness, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1)))) * 100, 1)
+n_Wellness_bis     <- round(as.numeric(table(BRFSS_final[BRFSS_final$flag_complete_UMN == 1 & BRFSS_final$LGBQ == 2,]$Wellness)), 0)
+prop_Wellness_bis  <- round(as.numeric(prop.table(svytable(~Wellness, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2)))) * 100, 1)
+
+cat(paste0(prop_Wellness, " (", format(n_Wellness, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Wellness_str, " (", format(n_Wellness_str, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Wellness_lgbq, " (", format(n_Wellness_lgbq, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Wellness_les, " (", format(n_Wellness_les, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+cat(paste0(prop_Wellness_bis, " (", format(n_Wellness_bis, big.mark = ",", scientific = FALSE), ")"), sep = "\n")
+```
+
+
+## Figure 1
+
+```{r Figure 1}
+#### Ever screening ------------------------------------------------------------
+ci_BC_Ever        <- svyciprop(~BC_Ever, sub.BRFSS_final, method = "logit")
+ci_BC_Ever_str    <- svyciprop(~BC_Ever, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0), method = "logit")
+ci_BC_Ever_lgbq   <- svyciprop(~BC_Ever, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1), method = "logit")
+ci_BC_Ever_les    <- svyciprop(~BC_Ever, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1), method = "logit")
+ci_BC_Ever_bis    <- svyciprop(~BC_Ever, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2), method = "logit")
+
+cat(paste0(round(ci_BC_Ever[1] * 100, 1), " (", round(attr(ci_BC_Ever, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_Ever, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_BC_Ever_str[1] * 100, 1), " (", round(attr(ci_BC_Ever_str, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_Ever_str, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_BC_Ever_lgbq[1] * 100, 1), " (", round(attr(ci_BC_Ever_lgbq, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_Ever_lgbq, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_BC_Ever_les[1] * 100, 1), " (", round(attr(ci_BC_Ever_les, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_Ever_les, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_BC_Ever_bis[1] * 100, 1), " (", round(attr(ci_BC_Ever_bis, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_Ever_bis, "ci")[2] * 100, 1), ")"), sep = "\n")
+
+#### UTD screening ------------------------------------------------------------
+ci_BC_UTD        <- svyciprop(~BC_UTD, sub.BRFSS_final, method = "logit")
+ci_BC_UTD_str    <- svyciprop(~BC_UTD, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0), method = "logit")
+ci_BC_UTD_lgbq   <- svyciprop(~BC_UTD, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1), method = "logit")
+ci_BC_UTD_les    <- svyciprop(~BC_UTD, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1), method = "logit")
+ci_BC_UTD_bis    <- svyciprop(~BC_UTD, subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2), method = "logit")
+
+cat(paste0(round(ci_BC_UTD[1] * 100, 1), " (", round(attr(ci_BC_UTD, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_UTD, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_BC_UTD_str[1] * 100, 1), " (", round(attr(ci_BC_UTD_str, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_UTD_str, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_BC_UTD_lgbq[1] * 100, 1), " (", round(attr(ci_BC_UTD_lgbq, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_UTD_lgbq, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_BC_UTD_les[1] * 100, 1), " (", round(attr(ci_BC_UTD_les, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_UTD_les, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_BC_UTD_bis[1] * 100, 1), " (", round(attr(ci_BC_UTD_bis, "ci")[1] * 100, 1),"-",  round(attr(ci_BC_UTD_bis, "ci")[2] * 100, 1), ")"), sep = "\n")
+
+#### HouseIns ------------------------------------------------------------------
+ci_HouseIns        <- svyciprop(~I(HouseIns=="1"), sub.BRFSS_final, method = "logit")
+ci_HouseIns_str    <- svyciprop(~I(HouseIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0), method = "logit")
+ci_HouseIns_lgbq   <- svyciprop(~I(HouseIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1), method = "logit")
+ci_HouseIns_les    <- svyciprop(~I(HouseIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1), method = "logit")
+ci_HouseIns_bis    <- svyciprop(~I(HouseIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2), method = "logit")
+
+cat(paste0(round(ci_HouseIns[1] * 100, 1), " (", round(attr(ci_HouseIns, "ci")[1] * 100, 1),"-",  round(attr(ci_HouseIns, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_HouseIns_str[1] * 100, 1), " (", round(attr(ci_HouseIns_str, "ci")[1] * 100, 1),"-",  round(attr(ci_HouseIns_str, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_HouseIns_lgbq[1] * 100, 1), " (", round(attr(ci_HouseIns_lgbq, "ci")[1] * 100, 1),"-",  round(attr(ci_HouseIns_lgbq, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_HouseIns_les[1] * 100, 1), " (", round(attr(ci_HouseIns_les, "ci")[1] * 100, 1),"-",  round(attr(ci_HouseIns_les, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_HouseIns_bis[1] * 100, 1), " (", round(attr(ci_HouseIns_bis, "ci")[1] * 100, 1),"-",  round(attr(ci_HouseIns_bis, "ci")[2] * 100, 1), ")"), sep = "\n")
+
+#### TransIns ------------------------------------------------------------------
+ci_TransIns        <- svyciprop(~I(TransIns=="1"), sub.BRFSS_final, method = "logit")
+ci_TransIns_str    <- svyciprop(~I(TransIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0), method = "logit")
+ci_TransIns_lgbq   <- svyciprop(~I(TransIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1), method = "logit")
+ci_TransIns_les    <- svyciprop(~I(TransIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1), method = "logit")
+ci_TransIns_bis    <- svyciprop(~I(TransIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2), method = "logit")
+
+cat(paste0(round(ci_TransIns[1] * 100, 1), " (", round(attr(ci_TransIns, "ci")[1] * 100, 1),"-",  round(attr(ci_TransIns, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_TransIns_str[1] * 100, 1), " (", round(attr(ci_TransIns_str, "ci")[1] * 100, 1),"-",  round(attr(ci_TransIns_str, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_TransIns_lgbq[1] * 100, 1), " (", round(attr(ci_TransIns_lgbq, "ci")[1] * 100, 1),"-",  round(attr(ci_TransIns_lgbq, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_TransIns_les[1] * 100, 1), " (", round(attr(ci_TransIns_les, "ci")[1] * 100, 1),"-",  round(attr(ci_TransIns_les, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_TransIns_bis[1] * 100, 1), " (", round(attr(ci_TransIns_bis, "ci")[1] * 100, 1),"-",  round(attr(ci_TransIns_bis, "ci")[2] * 100, 1), ")"), sep = "\n")
+
+#### UtilityIns ------------------------------------------------------------------
+ci_UtilityIns        <- svyciprop(~I(UtilityIns=="1"), sub.BRFSS_final, method = "logit")
+ci_UtilityIns_str    <- svyciprop(~I(UtilityIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0), method = "logit")
+ci_UtilityIns_lgbq   <- svyciprop(~I(UtilityIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1), method = "logit")
+ci_UtilityIns_les    <- svyciprop(~I(UtilityIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1), method = "logit")
+ci_UtilityIns_bis    <- svyciprop(~I(UtilityIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2), method = "logit")
+
+cat(paste0(round(ci_UtilityIns[1] * 100, 1), " (", round(attr(ci_UtilityIns, "ci")[1] * 100, 1),"-",  round(attr(ci_UtilityIns, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_UtilityIns_str[1] * 100, 1), " (", round(attr(ci_UtilityIns_str, "ci")[1] * 100, 1),"-",  round(attr(ci_UtilityIns_str, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_UtilityIns_lgbq[1] * 100, 1), " (", round(attr(ci_UtilityIns_lgbq, "ci")[1] * 100, 1),"-",  round(attr(ci_UtilityIns_lgbq, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_UtilityIns_les[1] * 100, 1), " (", round(attr(ci_UtilityIns_les, "ci")[1] * 100, 1),"-",  round(attr(ci_UtilityIns_les, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_UtilityIns_bis[1] * 100, 1), " (", round(attr(ci_UtilityIns_bis, "ci")[1] * 100, 1),"-",  round(attr(ci_UtilityIns_bis, "ci")[2] * 100, 1), ")"), sep = "\n")
+
+#### FoodStamp ------------------------------------------------------------------
+ci_FoodStamp        <- svyciprop(~I(FoodStamp=="1"), sub.BRFSS_final, method = "logit")
+ci_FoodStamp_str    <- svyciprop(~I(FoodStamp=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0), method = "logit")
+ci_FoodStamp_lgbq   <- svyciprop(~I(FoodStamp=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1), method = "logit")
+ci_FoodStamp_les    <- svyciprop(~I(FoodStamp=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1), method = "logit")
+ci_FoodStamp_bis    <- svyciprop(~I(FoodStamp=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2), method = "logit")
+
+cat(paste0(round(ci_FoodStamp[1] * 100, 1), " (", round(attr(ci_FoodStamp, "ci")[1] * 100, 1),"-",  round(attr(ci_FoodStamp, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_FoodStamp_str[1] * 100, 1), " (", round(attr(ci_FoodStamp_str, "ci")[1] * 100, 1),"-",  round(attr(ci_FoodStamp_str, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_FoodStamp_lgbq[1] * 100, 1), " (", round(attr(ci_FoodStamp_lgbq, "ci")[1] * 100, 1),"-",  round(attr(ci_FoodStamp_lgbq, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_FoodStamp_les[1] * 100, 1), " (", round(attr(ci_FoodStamp_les, "ci")[1] * 100, 1),"-",  round(attr(ci_FoodStamp_les, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_FoodStamp_bis[1] * 100, 1), " (", round(attr(ci_FoodStamp_bis, "ci")[1] * 100, 1),"-",  round(attr(ci_FoodStamp_bis, "ci")[2] * 100, 1), ")"), sep = "\n")
+
+#### EmployIns ------------------------------------------------------------------
+ci_EmployIns        <- svyciprop(~I(EmployIns == "1"), sub.BRFSS_final, method = "logit")
+ci_EmployIns_str    <- svyciprop(~I(EmployIns == "1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0), method = "logit")
+ci_EmployIns_lgbq   <- svyciprop(~I(EmployIns == "1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1), method = "logit")
+ci_EmployIns_les    <- svyciprop(~I(EmployIns == "1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1), method = "logit")
+ci_EmployIns_bis    <- svyciprop(~I(EmployIns == "1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2), method = "logit")
+
+cat(paste0(round(ci_EmployIns[1] * 100, 1), " (", round(attr(ci_EmployIns, "ci")[1] * 100, 1),"-",  round(attr(ci_EmployIns, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_EmployIns_str[1] * 100, 1), " (", round(attr(ci_EmployIns_str, "ci")[1] * 100, 1),"-",  round(attr(ci_EmployIns_str, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_EmployIns_lgbq[1] * 100, 1), " (", round(attr(ci_EmployIns_lgbq, "ci")[1] * 100, 1),"-",  round(attr(ci_EmployIns_lgbq, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_EmployIns_les[1] * 100, 1), " (", round(attr(ci_EmployIns_les, "ci")[1] * 100, 1),"-",  round(attr(ci_EmployIns_les, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_EmployIns_bis[1] * 100, 1), " (", round(attr(ci_EmployIns_bis, "ci")[1] * 100, 1),"-",  round(attr(ci_EmployIns_bis, "ci")[2] * 100, 1), ")"), sep = "\n")
+
+#### FoodIns ------------------------------------------------------------------
+ci_FoodIns        <- svyciprop(~I(FoodIns=="1"), sub.BRFSS_final, method = "logit")
+ci_FoodIns_str    <- svyciprop(~I(FoodIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0), method = "logit")
+ci_FoodIns_lgbq   <- svyciprop(~I(FoodIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1), method = "logit")
+ci_FoodIns_les    <- svyciprop(~I(FoodIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1), method = "logit")
+ci_FoodIns_bis    <- svyciprop(~I(FoodIns=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2), method = "logit")
+
+cat(paste0(round(ci_FoodIns[1] * 100, 1), " (", round(attr(ci_FoodIns, "ci")[1] * 100, 1),"-",  round(attr(ci_FoodIns, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_FoodIns_str[1] * 100, 1), " (", round(attr(ci_FoodIns_str, "ci")[1] * 100, 1),"-",  round(attr(ci_FoodIns_str, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_FoodIns_lgbq[1] * 100, 1), " (", round(attr(ci_FoodIns_lgbq, "ci")[1] * 100, 1),"-",  round(attr(ci_FoodIns_lgbq, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_FoodIns_les[1] * 100, 1), " (", round(attr(ci_FoodIns_les, "ci")[1] * 100, 1),"-",  round(attr(ci_FoodIns_les, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_FoodIns_bis[1] * 100, 1), " (", round(attr(ci_FoodIns_bis, "ci")[1] * 100, 1),"-",  round(attr(ci_FoodIns_bis, "ci")[2] * 100, 1), ")"), sep = "\n")
+
+#### EmoSupport ------------------------------------------------------------------
+ci_EmoSupport        <- svyciprop(~I(EmoSupport=="1"), sub.BRFSS_final, method = "logit")
+ci_EmoSupport_str    <- svyciprop(~I(EmoSupport=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 0), method = "logit")
+ci_EmoSupport_lgbq   <- svyciprop(~I(EmoSupport=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ_bin == 1), method = "logit")
+ci_EmoSupport_les    <- svyciprop(~I(EmoSupport=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 1), method = "logit")
+ci_EmoSupport_bis    <- svyciprop(~I(EmoSupport=="1"), subset(set.BRFSS_final, flag_complete_UMN == 1 & LGBQ == 2), method = "logit")
+
+cat(paste0(round(ci_EmoSupport[1] * 100, 1), " (", round(attr(ci_EmoSupport, "ci")[1] * 100, 1),"-",  round(attr(ci_EmoSupport, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_EmoSupport_str[1] * 100, 1), " (", round(attr(ci_EmoSupport_str, "ci")[1] * 100, 1),"-",  round(attr(ci_EmoSupport_str, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_EmoSupport_lgbq[1] * 100, 1), " (", round(attr(ci_EmoSupport_lgbq, "ci")[1] * 100, 1),"-",  round(attr(ci_EmoSupport_lgbq, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_EmoSupport_les[1] * 100, 1), " (", round(attr(ci_EmoSupport_les, "ci")[1] * 100, 1),"-",  round(attr(ci_EmoSupport_les, "ci")[2] * 100, 1), ")"), sep = "\n")
+cat(paste0(round(ci_EmoSupport_bis[1] * 100, 1), " (", round(attr(ci_EmoSupport_bis, "ci")[1] * 100, 1),"-",  round(attr(ci_EmoSupport_bis, "ci")[2] * 100, 1), ")"), sep = "\n")
+```
+
+## Attenuation
+
+```{r attenuation}
+demo    <- c("Age", "Race", "Region", "Urban")
+ses     <- c("Edu", "Employ", "Marital_Cat", "Income_Cat")
+health  <- c("HLTHSTAT", "Chronic_Cat")
+access  <- c("Hlthplan", "RegSource", "Wellness", "MED_Dff")
+umn     <- c("EmoSupport", "EmployIns", "FoodIns", "FoodStamp",
+             "HouseIns", "TransIns", "UtilityIns")
+
+models <- list(
+  M1_crude   = c("LGBQ_bis"),
+  M2_demo    = c("LGBQ_bis", demo),
+  M3_ses     = c("LGBQ_bis", demo, ses),
+  M4_health  = c("LGBQ_bis", demo, ses, health),
+  M5_access  = c("LGBQ_bis", demo, ses, health, access),
+  M6_umn     = c("LGBQ_bis", demo, ses, health, access, umn)
+)
+
+fit_one <- function(rhs_vars, design, outcome = "BC_UTD") {
+  f <- as.formula(paste(outcome, "~", paste(rhs_vars, collapse = " + ")))
+  svyglm(f, design = design, family = quasibinomial())
+}
+
+fits <- lapply(models, fit_one, design = subset(set.BRFSS_final, flag_complete_UMN == 1))
+
+extract_lgbq <- function(fit) {
+  s <- summary(fit)$coefficients
+  row <- s["LGBQ_bis", ]
+  c(beta = row[1], se = row[2],
+    OR = exp(row[1]),
+    OR_lo = exp(row[1] - 1.96 * row[2]),
+    OR_hi = exp(row[1] + 1.96 * row[2]),
+    p = row[4])
+}
+
+att_tab <- t(sapply(fits, extract_lgbq))
+att_tab <- as.data.frame(att_tab)
+att_tab$model <- rownames(att_tab)
+
+# % attenuation relative to crude
+beta_crude <- att_tab$beta[1]
+att_tab$pct_attenuation <- (beta_crude - att_tab$beta) / beta_crude * 100
+
+# Incremental attenuation
+att_tab$incremental_pct <- c(NA, -diff(att_tab$beta) / beta_crude * 100)
+
+print(att_tab[, c("model", "beta.Estimate", "OR.Estimate", "OR_lo.Estimate", "OR_hi.Estimate", "p.Pr(>|t|)",
+                  "pct_attenuation", "incremental_pct")],
+      row.names = FALSE)
+
+```
+
+## Decomposition
+
+```{r Decomp}
+setwd(dir)
+source("./03.Code/04_11.Decomposition_binary_complete.R")
+source("./03.Code/04_22.Decomposition_bisexual_complete.R")
+source("./03.Code/04_33.Decomposition_binary_all.R")
+source("./03.Code/04_44.Decomposition_bisexual_all.R")
+```
+
+
+## Interaction
+
+```{r Interact}
+setwd(dir)
+
+source("./03.Code/05_1.Interaction_binary_complete.R")
+source("./03.Code/05_2.Interaction_bisexual_complete.R")
+source("./03.Code/05_3.Interaction_binary_all.R")
+source("./03.Code/05_4.Interaction_bisexual_all.R")
+```
+
+## Prevalence figure
+
+```{r Figures}
+library(ggplot2)
+library(dplyr)
+
+# long format: one row per indicator × group
+dat <- expand.grid(
+  indicator = c("Food insecurity",
+                "Receiving food stamps (SNAP)",
+                "Housing insecurity",
+                "Employment insecurity",
+                "Utility insecurity",
+                "Lack of social and emotional support",
+                "Transportation insecurity"
+                ),
+  group     = c("Straight", "LGBQ", "Lesbian/gay", "Bisexual/queer")) %>%
+  mutate(prev = c(12.2, 9.8,  9.2,  7.5,  6.6, 6.5,  5.8,   
+                  19.1, 17.1, 17.0, 12.0, 9.7, 8.9,  12.6,   
+                  10.7, 10.7, 11.6, 6.5, 8.7, 5.1,  4.7,   
+                  23.8, 20.8, 20.1, 15.1, 10.2, 11.0, 17.1),
+         lcl  = c(11.7, 9.3, 8.7, 7.1, 6.2, 6.1, 5.4,  
+                  14.8, 12.7, 12.6, 8.0, 7.7, 7.1, 8.4,  
+                  7.7,  7.4, 8.1, 4.7, 5.8, 2.8, 3.4,  
+                  17.6, 14.5, 13.8, 9.2, 7.8, 8.6, 10.9),
+         ucl  = c(12.7, 10.2, 9.7,  7.9, 7.0, 7.0, 6.2,  
+                  24.3, 22.7, 22.6, 17.6, 12.1, 11.1, 18.4,  
+                  14.8, 15.2, 16.3, 9.0, 13.0, 9.2, 6.6,  
+                  31.3, 28.9, 28.4, 23.6, 13.3, 13.9, 25.7))
+
+dodge <- position_dodge(width = 0.8, reverse = TRUE)
+
+ggplot(dat, aes(x = indicator, y = prev, fill = group)) +
+  geom_col(position = dodge, width = 0.7) +
+  geom_errorbar(aes(ymin = lcl, ymax = ucl),
+                position = dodge, width = 0.25,
+                linewidth = 0.4, color = "gray25") +
+  coord_flip() +                                              
+  scale_x_discrete(limits = rev(levels(dat$indicator))) +     
+  scale_fill_manual(values = c("#261100", "#BF5700", "#FDB863", "#E08214")) +
+  scale_y_continuous(name = "Prevalence (%)",
+                     limits = c(0, 35), breaks = seq(0, 35, 5),
+                     expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, fill = NULL) +
+  theme_bw(base_size = 11, base_family = "Times New Roman") +
+  theme(panel.grid.major.y = element_blank(),                 
+        legend.position = "top")
+```
+
+# Sampling map
+
+```{r}
+#install.packages("usmap")
+library(usmap)
+library(ggplot2)
+library(dplyr)
+
+both  <- c("AK","DE","GA","IN","IA","KS","MA","MN","MT","NM","NC","RI","UT","WV","WI")
+y2022 <- c("CT","MO","NV","TX","VT","WA")
+y2024 <- c("AL","AZ","HI","ID","LA","MD","NJ","ND")
+
+dat <- data.frame(state = c(both, y2022, y2024),
+                  status = rep(c("Both 2022 & 2024", "2022 only", "2024 only"),
+                               times = c(length(both), length(y2022), length(y2024))))
+
+lab <- c("Both 2022 & 2024" = sprintf("Both 2022 & 2024 (n=%d)", length(both)),
+         "2022 only"        = sprintf("2022 only (n=%d)",        length(y2022)),
+         "2024 only"        = sprintf("2024 only (n=%d + VI)",     length(y2024)),
+         "Not included"     = "Not included")
+
+dat <- dat |>
+  mutate(status = factor(status,
+                         levels = c("Both 2022 & 2024","2022 only","2024 only")))
+
+plot_usmap(data = dat, values = "status", color = "white", linewidth = 0.3) +
+  scale_fill_manual(values = c("Both 2022 & 2024" = "#111111",
+                               "2022 only"        = "#4D4D4D",
+                               "2024 only"        = "#9E9E9E"),
+                    labels = lab[1:3],
+                    na.value = "#EEEEEE",
+                    na.translate = TRUE,
+                    breaks = levels(dat$status)) +
+  labs(fill = NULL,
+       caption = "VI = U.S. Virgin Islands (not shown on map).") +
+  theme_void(base_family = "Times New Roman") +
+  theme(legend.position = "top",
+        plot.caption = element_text(hjust = 0, size = 8))
+```
